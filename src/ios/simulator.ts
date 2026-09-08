@@ -486,6 +486,10 @@ async function seizeLease(udid: string, intent: SeizeIntent): Promise<DeviceLeas
 	// now". `claimedHere` is the only thing that can, which makes it authority
 	// for reclamation, not a hint: without this check a scratch-ceiling sweep
 	// could delete a device a concurrent `openSession` had just claimed.
+	// Whether *this* call is the one that marked the device. A `release` seize
+	// runs against a udid the holder already marked, and unwinding that on our
+	// own failure would strip a live session's marker.
+	let markedHere = false;
 	return await withLedger((state) => {
 		// Checked inside the lock, immediately before the holder is rewritten.
 		// A check before the first await would be a TOCTOU: a concurrent
@@ -506,8 +510,16 @@ async function seizeLease(udid: string, intent: SeizeIntent): Promise<DeviceLeas
 		// reclaim from this process — it would read `holderPid === process.pid`
 		// and conclude the device is ours to take, then both callers would run
 		// simctl against the same device. Every teardown path clears this.
+		markedHere = !claimedHere.has(udid);
 		claimedHere.add(udid);
 		return { ...entry };
+	}).catch((error: unknown) => {
+		// `withLedger` mutates in memory and then writes; a failed write leaves
+		// the `add` above applied while no lease was recorded. Unwind only a
+		// marker this call introduced: a contention throw happens before the
+		// add, and a `release` seize runs against a marker its own session set.
+		if (markedHere) claimedHere.delete(udid);
+		throw error;
 	});
 }
 
@@ -534,6 +546,14 @@ async function destroyOwned(lease: DeviceLease, options: { alreadySeized?: boole
 	// entry. Everyone else must pass the reclaim gate.
 	const seized = options.alreadySeized ? lease : await seizeLease(lease.udid, "reclaim");
 	if (!seized) return;
+
+	// `claimedHere` must never be looser than the ledger. Clearing the marker
+	// while the ledger still records us as holder would let a second reclaim
+	// in this process seize on `holderPid === process.pid` and run simctl
+	// against a device the first call is still working on. So the marker is
+	// dropped only on the two paths that first return ownership atomically:
+	// the entry is deleted, or `holderPid` is reset to 0. Every other exit
+	// keeps it — ownership is unclear, and holding is the fail-closed side.
 	if (seized.provenance !== "created") {
 		throw new Error(`refusing to delete ${lease.udid}: provenance changed to "${seized.provenance}"`);
 	}
@@ -546,7 +566,10 @@ async function destroyOwned(lease: DeviceLease, options: { alreadySeized?: boole
 			const entry = state.devices[lease.udid];
 			if (entry) entry.holderPid = 0;
 		});
-		throw new Error(`simctl delete ${lease.udid} failed: ${(deleted.stderr || deleted.stdout).trim().slice(0, 300)}`);
+		claimedHere.delete(lease.udid);
+		throw new Error(
+			`simctl delete ${lease.udid} failed: ${(deleted.stderr || deleted.stdout).trim().slice(0, 300)}`,
+		);
 	}
 	await withLedger((state) => {
 		delete state.devices[lease.udid];

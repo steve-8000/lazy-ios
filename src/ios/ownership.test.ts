@@ -10,7 +10,7 @@
  */
 
 import { afterAll, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -119,6 +119,55 @@ test("a device with no lease is left untouched", async () => {
 	const outcome = await releaseSimulator("UDID-never-leased", { destroy: true });
 
 	expect(outcome.action).toBe("not-leased");
+});
+
+test("a failed delete leaves the device reclaimable, not permanently barred", async () => {
+	// `claimedHere` must never be looser OR tighter than the ledger. When a
+	// delete fails, `destroyOwned` hands the lease back (holderPid = 0); if the
+	// in-process marker survived, this process alone would treat the device as
+	// busy forever — reclaim seizes refusing and reuse skipping it.
+	const udid = "UDID-failed-delete";
+	await seedLease(udid, { holderPid: 0 });
+
+	const stub = join(home, "stub");
+	mkdirSync(stub, { recursive: true });
+	const listing = JSON.stringify({
+		devices: {
+			"com.apple.CoreSimulator.SimRuntime.iOS-27-0": [
+				{ udid, name: "scratch", state: "Shutdown", isAvailable: true },
+			],
+		},
+	});
+	await writeFile(
+		join(stub, "xcrun"),
+		`#!/bin/sh
+case "$2" in
+  delete) echo "Boom: device busy" >&2; exit 1 ;;
+  list) cat <<'JSON'
+${listing}
+JSON
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+`,
+		{ encoding: "utf8", mode: 0o755 },
+	);
+
+	const realPath = process.env.PATH ?? "";
+	process.env.PATH = `${stub}:${realPath}`;
+	try {
+		await expect(releaseSimulator(udid, { destroy: true })).rejects.toThrow(/simctl delete .* failed/);
+
+		// The retry must reach simctl again rather than refusing on a stale
+		// marker. Before the fix this reported "an open session in this process
+		// is using it" and never tried again.
+		const reaped = await reapSimulators({ destroyScratch: true });
+		const skipped = reaped.skipped.find((entry) => entry.udid === udid);
+		expect(skipped?.reason).toMatch(/simctl delete .* failed/);
+		expect(skipped?.reason).not.toMatch(/open session in this process/);
+	} finally {
+		process.env.PATH = realPath;
+	}
 });
 
 test("a corrupt ledger fails closed instead of reading as empty", async () => {
