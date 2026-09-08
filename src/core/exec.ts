@@ -61,12 +61,24 @@ export async function run(argv: readonly string[], options: RunOptions = {}): Pr
 		stdin: options.stdin === undefined ? "ignore" : new TextEncoder().encode(options.stdin),
 		stdout: "pipe",
 		stderr: "pipe",
+		// setsid: makes the child a process-group leader so the timeout below can
+		// reach its descendants. `xcodebuild` alone spawns swift-frontend, ld,
+		// simulator helpers and an XCBBuildService; killing only the direct child
+		// leaves those running and recreates the process leak this tool exists to
+		// fix. The child is still awaited here — this is not backgrounding.
+		detached: true,
 	});
 
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
-		proc.kill("SIGKILL");
+		// Negative pid targets the whole group. Falls back to the lone child if
+		// the group is already gone (ESRCH) or was never created.
+		try {
+			process.kill(-proc.pid, "SIGKILL");
+		} catch {
+			proc.kill("SIGKILL");
+		}
 	}, timeout);
 
 	try {

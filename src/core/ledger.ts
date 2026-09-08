@@ -111,7 +111,17 @@ async function acquireLock(): Promise<() => Promise<void>> {
 		for (;;) {
 			try {
 				await link(staging, LOCK_PATH);
+				const token = await Bun.file(LOCK_PATH).stat();
 				return async () => {
+					// Only unlink a lock that is still the one we created. If a
+					// waiter judged ours stale and took over, deleting blindly
+					// would drop *their* lock and admit a third writer.
+					try {
+						const current = await Bun.file(LOCK_PATH).stat();
+						if (current.ino !== token.ino) return;
+					} catch {
+						return; // already gone
+					}
 					await rm(LOCK_PATH, { force: true });
 				};
 			} catch (error) {
@@ -171,19 +181,48 @@ export function isAlive(pid: number): boolean {
 	}
 }
 
-export async function readLedger(): Promise<LedgerState> {
-	try {
-		const raw = await readFile(LEDGER_PATH, "utf8");
-		const parsed = JSON.parse(raw) as Partial<LedgerState>;
-		if (parsed.version !== LEDGER_VERSION) return emptyState();
-		return {
-			version: LEDGER_VERSION,
-			devices: parsed.devices ?? {},
-			processes: parsed.processes ?? {},
-		};
-	} catch {
-		return emptyState();
+/** The ledger exists but cannot be interpreted. Never treated as "empty". */
+export class LedgerCorrupt extends Error {
+	constructor(reason: string) {
+		super(
+			`${LEDGER_PATH} is unreadable (${reason}). lazy-ios will not reclaim devices while ownership is unknown. ` +
+				`Inspect the file; move it aside only once you have confirmed no lazy-ios simulators are still booted.`,
+		);
+		this.name = "LedgerCorrupt";
 	}
+}
+
+/**
+ * Read the ledger, or fail closed.
+ *
+ * A missing file is normal — nothing has been leased yet. A file that exists
+ * but will not parse is *not* the same thing: answering "empty" there would
+ * tell the reaper that every lazy-ios device is unowned, and the very next
+ * cleanup would either orphan live devices or delete devices whose provenance
+ * we could no longer prove. Refusing is the safe direction.
+ */
+export async function readLedger(): Promise<LedgerState> {
+	let raw: string;
+	try {
+		raw = await readFile(LEDGER_PATH, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
+		throw new LedgerCorrupt((error as Error).message);
+	}
+	let parsed: Partial<LedgerState>;
+	try {
+		parsed = JSON.parse(raw) as Partial<LedgerState>;
+	} catch (error) {
+		throw new LedgerCorrupt(`invalid JSON: ${(error as Error).message}`);
+	}
+	if (parsed.version !== LEDGER_VERSION) {
+		throw new LedgerCorrupt(`schema version ${String(parsed.version)}, expected ${LEDGER_VERSION}`);
+	}
+	return {
+		version: LEDGER_VERSION,
+		devices: parsed.devices ?? {},
+		processes: parsed.processes ?? {},
+	};
 }
 
 /**

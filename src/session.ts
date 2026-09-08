@@ -81,17 +81,40 @@ export function getSession(id: string): Session {
 		const known = [...sessions.keys()];
 		throw new Error(`unknown session "${id}"${known.length ? ` (open: ${known.join(", ")})` : " (none open)"}`);
 	}
+	// Teardown in flight: the device may already be shut down, so driving it
+	// would either hang or act on a device we no longer own.
+	if (session.closing) throw new Error(`session "${id}" is being closed`);
 	session.lastUsedAt = Date.now();
 	// Push the ledger deadline out too. The deadline is what a human reads to
 	// judge whether a run has gone wrong; without renewal, a long interactive
-	// session would show as overdue forever.
-	if (session.kind === "simulator") void renewLease(session.udid, leaseTtl(session.idleTimeoutMs));
+	// session would show as overdue forever. Renewal is advisory: a failure
+	// must not reject into the MCP stdio loop and kill the server.
+	if (session.kind === "simulator") {
+		void renewLease(session.udid, leaseTtl(session.idleTimeoutMs)).catch(() => undefined);
+	}
 	return session;
 }
 
 /** Ledger lease length for a given idle budget: generous, but finite. */
 function leaseTtl(idleTimeoutMs: number): number {
 	return Math.max(idleTimeoutMs * 2, 30 * 60_000);
+}
+
+/**
+ * Ids handed out but not yet registered.
+ *
+ * `sessions` only gains an entry after the device is acquired, which is many
+ * awaits later; until then a concurrent open sees the id as free.
+ */
+const reservedIds = new Set<string>();
+
+function reserveSessionId(kind: TargetKind): string {
+	for (;;) {
+		const id = `${kind}-${crypto.randomUUID().slice(0, 8)}`;
+		if (sessions.has(id) || reservedIds.has(id)) continue;
+		reservedIds.add(id);
+		return id;
+	}
 }
 
 export interface OpenSimulatorRequest {
@@ -128,13 +151,25 @@ export class PreflightBlocked extends Error {
 
 export async function openSession(request: OpenRequest): Promise<Session> {
 	wireShutdown();
-	// Never reuse a live id. A collision here silently replaces the earlier
-	// session in the registry, and its device is then held by a lease nobody
-	// will ever release — measured once, with `Bun.randomUUIDv7().slice(0, 8)`,
-	// whose first 8 hex digits are the millisecond timestamp and therefore
-	// identical for concurrent opens.
-	let id = `${request.kind}-${crypto.randomUUID().slice(0, 8)}`;
-	while (sessions.has(id)) id = `${request.kind}-${crypto.randomUUID().slice(0, 8)}`;
+	// Reserve the id synchronously, before the first await, and hold the
+	// reservation until the session is registered. A collision silently
+	// replaces the earlier session in the registry, and its device is then
+	// held by a lease nobody will ever release — measured once, with
+	// `Bun.randomUUIDv7().slice(0, 8)`, whose leading digits are the
+	// millisecond timestamp and so are identical for concurrent opens.
+	// Checking the registry alone is not enough: a concurrent open has not
+	// registered yet either.
+	const id = reserveSessionId(request.kind);
+	try {
+		return await openReserved(id, request);
+	} finally {
+		// Once registered the id lives in `sessions`; on failure it goes back
+		// into circulation. Either way the reservation is done its job.
+		reservedIds.delete(id);
+	}
+}
+
+async function openReserved(id: string, request: OpenRequest): Promise<Session> {
 	const purpose = request.purpose ?? "lazy-ios session";
 	const idleTimeoutMs = request.idleTimeoutMs ?? DEFAULT_IDLE_MS;
 

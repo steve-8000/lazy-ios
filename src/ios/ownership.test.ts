@@ -11,6 +11,7 @@
 
 import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -21,8 +22,8 @@ import { join } from "node:path";
 const home = mkdtempSync(join(tmpdir(), "lazy-ios-test-"));
 process.env.LAZY_IOS_HOME = home;
 
-const { overdue, readLedger, reclaimable, withLedger } = await import("../core/ledger.ts");
-const { releaseSimulator } = await import("./simulator.ts");
+const { LedgerCorrupt, overdue, readLedger, reclaimable, withLedger } = await import("../core/ledger.ts");
+const { reapSimulators, releaseSimulator } = await import("./simulator.ts");
 
 afterAll(() => {
 	rmSync(home, { recursive: true, force: true });
@@ -118,6 +119,27 @@ test("a device with no lease is left untouched", async () => {
 	const outcome = await releaseSimulator("UDID-never-leased", { destroy: true });
 
 	expect(outcome.action).toBe("not-leased");
+});
+
+test("a corrupt ledger fails closed instead of reading as empty", async () => {
+	const udid = "UDID-corrupt-guard";
+	await seedLease(udid, { holderPid: DEAD_PID });
+	const ledgerFile = join(home, "ledger.json");
+	const good = await readFile(ledgerFile, "utf8");
+
+	await writeFile(ledgerFile, "{ this is not json", "utf8");
+	try {
+		// Reading it as "{}" would tell the reaper that every lazy-ios device is
+		// unowned — the shortest path to deleting something we cannot prove is
+		// ours. Refusing is the only safe answer.
+		await expect(readLedger()).rejects.toThrow(LedgerCorrupt);
+		await expect(reapSimulators({ destroyScratch: true })).rejects.toThrow(/unreadable/);
+	} finally {
+		await writeFile(ledgerFile, good, "utf8");
+	}
+
+	// And the lease is intact once the file is readable again.
+	expect((await readLedger()).devices[udid]).toBeDefined();
 });
 
 test("concurrent ledger writers do not lose updates", async () => {

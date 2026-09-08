@@ -137,18 +137,27 @@ async function processStartLine(pid: number): Promise<string> {
  * leak. Hence the command-line fallback when no start line was captured.
  */
 async function identityMatches(record: ProcessRecord): Promise<boolean> {
-	if (record.lstart) {
-		const current = await processStartLine(record.pid);
-		return current !== "" && current === record.lstart;
-	}
-	const probe = await run(["/bin/ps", "-o", "command=", "-p", String(record.pid)], {
+	const probe = await run(["/bin/ps", "-o", "lstart=,command=", "-p", String(record.pid)], {
 		timeout: 10_000,
 		env: { LC_ALL: "C" },
 	});
 	if (probe.code !== 0) return false;
-	const command = probe.stdout.trim();
+	const line = probe.stdout.trim();
+	if (line === "") return false;
+
+	// `lstart` has one-second resolution, so a pid recycled inside the same
+	// second could produce an identical string. The command line is the second
+	// factor: both must agree before anything is signalled.
+	const command = line.slice(record.lstart?.length ?? 0).trim() || line;
 	const port = record.argv[record.argv.indexOf("--port") + 1];
-	return /\bappium\b/.test(command) && (!port || command.includes(port));
+	const commandMatches = /\bappium\b/.test(command) && (!port || command.includes(port));
+	if (!commandMatches) return false;
+
+	// No recorded start line (a record written by an older build): the command
+	// match is all we have. Weaker, but refusing outright would strand our own
+	// server, which is the worse failure.
+	if (!record.lstart) return true;
+	return line.startsWith(record.lstart);
 }
 
 export async function stopAppium(): Promise<{ stopped: boolean; pid: number; reason: string }> {

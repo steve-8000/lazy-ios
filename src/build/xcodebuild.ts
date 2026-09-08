@@ -11,7 +11,7 @@
  * `-showBuildSettings` instead of guessing at DerivedData layout.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 
 import { run, runJson, type RunResult } from "../core/exec.ts";
@@ -214,7 +214,21 @@ export function derivedDataFor(project: ProjectRef): string {
 	return join(LAZY_HOME, "derived", `${project.name}-${Bun.hash(project.path).toString(16)}`);
 }
 
+/**
+ * The directories a build writes into.
+ *
+ * Created here rather than relying on another module's import side effect:
+ * `xcodebuild -resultBundlePath` fails outright if the parent is missing, and
+ * a successful build whose log write throws reports as a failure.
+ */
+function ensureOutputDirs(): void {
+	for (const directory of ["logs", "results", "derived"]) {
+		mkdirSync(join(LAZY_HOME, directory), { recursive: true });
+	}
+}
+
 export async function build(request: BuildRequest): Promise<BuildOutcome> {
+	ensureOutputDirs();
 	const configuration = request.configuration ?? "Debug";
 	const derivedDataPath = request.derivedDataPath ?? derivedDataFor(request.project);
 	const argv = [
@@ -294,6 +308,7 @@ interface XcTestSummary {
 }
 
 export async function test(request: TestRequest): Promise<TestSummary> {
+	ensureOutputDirs();
 	const configuration = request.configuration ?? "Debug";
 	const derivedDataPath = request.derivedDataPath ?? derivedDataFor(request.project);
 	const resultBundlePath = request.resultBundlePath ?? join(LAZY_HOME, "results", `test-${Date.now()}.xcresult`);
