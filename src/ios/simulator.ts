@@ -202,7 +202,7 @@ export async function acquireSimulator(options: AcquireOptions): Promise<Acquire
 
 	await enforceScratchCeiling();
 
-	const name = `${SCRATCH_PREFIX}-${deviceType.name.replaceAll(/\s+/g, "")}-${Bun.randomUUIDv7().slice(0, 8)}`;
+	const name = `${SCRATCH_PREFIX}-${deviceType.name.replaceAll(/\s+/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
 	const created = await runOk(["xcrun", "simctl", "create", name, deviceType.identifier, runtime.identifier], {
 		timeout: 120_000,
 	});
@@ -266,37 +266,46 @@ async function claim(
 	wasBooted: boolean,
 ): Promise<DeviceLease> {
 	const now = Date.now();
-	// A lease this process already holds is not free just because we are the
-	// holder: another open session is using that device.
+	// Reserve synchronously, before the first await. Checking membership and
+	// inserting on either side of `withLedger` leaves a window in which two
+	// concurrent opens both pass the check and both take the same device —
+	// then closing one shuts the other's target down. `Set.add` returning the
+	// set makes `has`-then-`add` the only option, so the check must happen
+	// with no suspension point between it and the insert.
 	if (claimedHere.has(device.udid)) {
 		throw new Error(`simulator ${device.udid} is already leased by an open session in this process`);
 	}
-	const lease = await withLedger((state) => {
-		const existing = state.devices[device.udid];
-		// Expiry is not release. A live holder keeps the device however long
-		// its run has taken.
-		if (existing && existing.holderPid !== process.pid && !unheld(existing)) {
-			throw new Error(
-				`simulator ${device.udid} is leased by live pid ${existing.holderPid} (lease until ${new Date(existing.expiresAt).toISOString()})`,
-			);
-		}
-		const lease: DeviceLease = {
-			udid: device.udid,
-			name: device.name,
-			runtime: device.runtime,
-			// A device we created stays "created" forever, even across re-leases.
-			provenance: existing?.provenance === "created" ? "created" : provenance,
-			acquiredAt: now,
-			expiresAt: now + ttl,
-			holderPid: process.pid,
-			purpose,
-			wasBooted: existing?.wasBooted ?? wasBooted,
-		};
-		state.devices[device.udid] = lease;
-		return lease;
-	});
 	claimedHere.add(device.udid);
-	return lease;
+	try {
+		return await withLedger((state) => {
+			const existing = state.devices[device.udid];
+			// Expiry is not release. A live holder keeps the device however long
+			// its run has taken.
+			if (existing && existing.holderPid !== process.pid && !unheld(existing)) {
+				throw new Error(
+					`simulator ${device.udid} is leased by live pid ${existing.holderPid} (lease until ${new Date(existing.expiresAt).toISOString()})`,
+				);
+			}
+			const lease: DeviceLease = {
+				udid: device.udid,
+				name: device.name,
+				runtime: device.runtime,
+				// A device we created stays "created" forever, even across re-leases.
+				provenance: existing?.provenance === "created" ? "created" : provenance,
+				acquiredAt: now,
+				expiresAt: now + ttl,
+				holderPid: process.pid,
+				purpose,
+				wasBooted: existing?.wasBooted ?? wasBooted,
+			};
+			state.devices[device.udid] = lease;
+			return lease;
+		});
+	} catch (error) {
+		// The reservation only stands for a lease we actually recorded.
+		claimedHere.delete(device.udid);
+		throw error;
+	}
 }
 
 /**

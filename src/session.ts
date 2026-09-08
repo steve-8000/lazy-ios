@@ -128,7 +128,13 @@ export class PreflightBlocked extends Error {
 
 export async function openSession(request: OpenRequest): Promise<Session> {
 	wireShutdown();
-	const id = `${request.kind}-${Bun.randomUUIDv7().slice(0, 8)}`;
+	// Never reuse a live id. A collision here silently replaces the earlier
+	// session in the registry, and its device is then held by a lease nobody
+	// will ever release — measured once, with `Bun.randomUUIDv7().slice(0, 8)`,
+	// whose first 8 hex digits are the millisecond timestamp and therefore
+	// identical for concurrent opens.
+	let id = `${request.kind}-${crypto.randomUUID().slice(0, 8)}`;
+	while (sessions.has(id)) id = `${request.kind}-${crypto.randomUUID().slice(0, 8)}`;
 	const purpose = request.purpose ?? "lazy-ios session";
 	const idleTimeoutMs = request.idleTimeoutMs ?? DEFAULT_IDLE_MS;
 

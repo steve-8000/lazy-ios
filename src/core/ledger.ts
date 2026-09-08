@@ -105,7 +105,7 @@ function ensureHome(): void {
 async function acquireLock(): Promise<() => Promise<void>> {
 	ensureHome();
 	const deadline = Date.now() + LOCK_WAIT_MS;
-	const staging = `${LOCK_PATH}.${process.pid}.${Bun.randomUUIDv7().slice(0, 8)}`;
+	const staging = `${LOCK_PATH}.${process.pid}.${crypto.randomUUID().slice(0, 8)}`;
 	await writeFile(staging, `${process.pid}\n`, "utf8");
 	try {
 		for (;;) {
@@ -198,7 +198,7 @@ export async function withLedger<T>(mutate: (state: LedgerState) => T | Promise<
 		try {
 			const state = await readLedger();
 			const value = await mutate(state);
-			const tmp = `${LEDGER_PATH}.${process.pid}.${Bun.randomUUIDv7().slice(0, 8)}.tmp`;
+			const tmp = `${LEDGER_PATH}.${process.pid}.${crypto.randomUUID().slice(0, 8)}.tmp`;
 			await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 			await rename(tmp, LEDGER_PATH);
 			return value;
