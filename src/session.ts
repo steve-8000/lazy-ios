@@ -365,21 +365,36 @@ function wireShutdown(): void {
 
 	// Synchronous-enough teardown: simctl shutdown is fast, and leaving a
 	// booted scratch device behind is precisely the bug this project fixes.
-	const bail = (signal: NodeJS.Signals): void => {
-		// `run` spawns children into their own process group so a timeout can
-		// reach descendants; the cost is that they no longer die with our group.
-		// An interrupted build would otherwise leave xcodebuild and its
-		// compilers running, and they would still be writing into a DerivedData
-		// tree whose simulator we are about to release.
-		killChildren();
-		void closeAll().finally(() => {
-			process.exit(signal === "SIGINT" ? 130 : 143);
-		});
-	};
-	process.once("SIGINT", bail);
-	process.once("SIGTERM", bail);
-	process.once("beforeExit", () => {
-		killChildren();
-		void closeAll();
+	process.once("SIGINT", (signal) => {
+		void shutdownGracefully(signal);
 	});
+	process.once("SIGTERM", (signal) => {
+		void shutdownGracefully(signal);
+	});
+	process.once("beforeExit", () => {
+		void shutdownGracefully(null);
+	});
+}
+
+/**
+ * Give every device back, then leave.
+ *
+ * Order matters and is not obvious:
+ *
+ * 1. `killChildren` stops long-running work — an `xcodebuild` mid-compile is
+ *    still writing into a DerivedData tree whose simulator we are about to
+ *    release. Children run in their own process groups (so timeouts can reach
+ *    descendants), which is exactly why they do not die with us.
+ * 2. Those SIGKILLs also hit any `simctl shutdown` a teardown already had in
+ *    flight, so that teardown must be allowed to settle and clear its handle
+ *    before new ones start. Skipping this left the device booted: `closeAll`
+ *    would join the doomed promise, record it as pending, and exit.
+ * 3. Only then `closeAll`, whose fresh simctl children are spawned after the
+ *    kill and are therefore untouched.
+ */
+async function shutdownGracefully(signal: NodeJS.Signals | null): Promise<void> {
+	killChildren();
+	await Promise.allSettled([...sessions.values()].map((session) => session.teardown).filter(Boolean));
+	await closeAll();
+	if (signal) process.exit(signal === "SIGINT" ? 130 : 143);
 }

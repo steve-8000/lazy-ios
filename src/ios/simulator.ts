@@ -307,8 +307,12 @@ async function claim(
 		return await withLedger((state) => {
 			const existing = state.devices[device.udid];
 			// Expiry is not release. A live holder keeps the device however long
-			// its run has taken.
-			if (existing && existing.holderPid !== process.pid && !unheld(existing)) {
+			// its run has taken — and "live holder" includes *us*: while a
+			// teardown holds the lease (seizeLease writes our own pid before
+			// running simctl), `claimedHere` is already empty, so our pid is the
+			// only thing left saying the device is busy. Overwriting it here let
+			// a concurrent acquire hand out a device that was mid-delete.
+			if (existing && !unheld(existing)) {
 				throw new LeaseContended(
 					`simulator ${device.udid} is leased by live pid ${existing.holderPid} (lease until ${new Date(existing.expiresAt).toISOString()})`,
 				);
@@ -400,6 +404,15 @@ async function enforceScratchCeiling(): Promise<void> {
 export interface ReleaseOptions {
 	/** Delete the device instead of leaving it shut down for reuse. */
 	destroy?: boolean;
+	/**
+	 * Who is giving the device back.
+	 *
+	 * `release` (default) is the holder returning its own device — it may take
+	 * a lease that `claimedHere` still lists, because that entry is its claim.
+	 * `reclaim` is a third party such as the reaper, and must lose to any open
+	 * session in this process.
+	 */
+	intent?: SeizeIntent;
 }
 
 export interface ReleaseOutcome {
@@ -416,7 +429,7 @@ export interface ReleaseOutcome {
 export async function releaseSimulator(udid: string, options: ReleaseOptions = {}): Promise<ReleaseOutcome> {
 	// Take the lease over atomically before touching the device: another
 	// lazy-ios instance may be mid-run against it, and `destroy` is instant.
-	const lease = await seizeLease(udid, "release");
+	const lease = await seizeLease(udid, options.intent ?? "release");
 	if (!lease) {
 		// Deliberately does NOT clear `claimedHere`: with no ledger entry the
 		// only way this udid is in that set is a concurrent `openSession` that
@@ -488,6 +501,12 @@ async function seizeLease(udid: string, intent: SeizeIntent): Promise<DeviceLeas
 			);
 		}
 		entry.holderPid = process.pid;
+		// Mark the seize window itself, in the same synchronous critical
+		// section. Writing our own pid is not enough to exclude a second
+		// reclaim from this process — it would read `holderPid === process.pid`
+		// and conclude the device is ours to take, then both callers would run
+		// simctl against the same device. Every teardown path clears this.
+		claimedHere.add(udid);
 		return { ...entry };
 	});
 }
@@ -575,9 +594,13 @@ export async function reapSimulators(options: { destroyScratch?: boolean } = {})
 		try {
 			// Always go through releaseSimulator: it re-seizes the lease inside
 			// the ledger lock. `candidates` is a snapshot, and between taking it
-			// and acting another process can legitimately claim the device —
-			// shutting it down from here would kill a live run.
-			released.push(await releaseSimulator(lease.udid, { destroy: options.destroyScratch }));
+			// and acting another process — or another session in this one — can
+			// legitimately claim the device; acting on the snapshot would kill a
+			// live run. `reclaim` is what makes the in-process case lose: the
+			// reaper is never the holder, so it must yield to `claimedHere`.
+			released.push(
+				await releaseSimulator(lease.udid, { destroy: options.destroyScratch, intent: "reclaim" }),
+			);
 		} catch (error) {
 			// A device that resists teardown keeps its ledger entry so the next
 			// reap tries again; silently dropping it would orphan it.

@@ -20,7 +20,7 @@
  * interleave a read-modify-write.
  */
 
-import { dlopen, FFIType } from "bun:ffi";
+import { dlopen, FFIType, read } from "bun:ffi";
 import { closeSync, mkdirSync, openSync } from "node:fs";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -111,9 +111,19 @@ const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
+/** errno values we care about; EAGAIN and EWOULDBLOCK are the same value. */
+const EWOULDBLOCK = 35;
+
 const libc = dlopen("libSystem.B.dylib", {
 	flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+	// Darwin keeps errno thread-local behind `__error()`, which returns `int *`.
+	__error: { args: [], returns: FFIType.ptr },
 });
+
+function currentErrno(): number {
+	const location = libc.symbols.__error();
+	return location === null ? 0 : read.i32(location, 0);
+}
 
 let lockFd: number | null = null;
 
@@ -135,6 +145,14 @@ async function acquireLock(): Promise<() => Promise<void>> {
 			return async () => {
 				libc.symbols.flock(fd, LOCK_UN);
 			};
+		}
+		// Only "someone else holds it" is worth retrying. EBADF or EINVAL means
+		// the descriptor is wrong, and spinning on that would burn the whole
+		// timeout and then report contention that never happened — while every
+		// queued `withLedger` waits behind it.
+		const code = currentErrno();
+		if (code !== EWOULDBLOCK) {
+			throw new Error(`flock on ${LOCK_PATH} failed with errno ${code}`);
 		}
 		if (Date.now() >= deadline) {
 			throw new Error(`ledger lock held for >${LOCK_WAIT_MS}ms at ${LOCK_PATH}`);
