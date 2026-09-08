@@ -10,7 +10,7 @@
  */
 
 import { run, runJson, runOk, waitFor } from "../core/exec.ts";
-import { type DeviceLease, isAlive, reclaimable, withLedger } from "../core/ledger.ts";
+import { type DeviceLease, overdue, reclaimable, unheld, withLedger } from "../core/ledger.ts";
 
 /** Devices we create are named with this prefix. It is a hint, never authority. */
 export const SCRATCH_PREFIX = "lazy-ios";
@@ -216,7 +216,16 @@ export async function acquireSimulator(options: AcquireOptions): Promise<Acquire
 		deviceTypeId: deviceType.identifier,
 		isAvailable: true,
 	};
-	const lease = await claim(device, "created", options.purpose, ttl, false);
+	// Rollback matters here: a device that exists but was never recorded is an
+	// orphan by construction — reaping only ever considers ledger entries, so
+	// nothing would clean it up. `claim` can fail on ledger lock contention.
+	let lease: DeviceLease;
+	try {
+		lease = await claim(device, "created", options.purpose, ttl, false);
+	} catch (error) {
+		await run(["xcrun", "simctl", "delete", udid], { timeout: 120_000 });
+		throw new Error(`created ${udid} but could not record it (rolled back with simctl delete): ${(error as Error).message}`);
+	}
 	await bootOrUnclaim(udid, false);
 	return { lease, device: (await findSimulator(udid)) ?? device, disposition: "created" };
 }
@@ -244,6 +253,7 @@ async function bootOrUnclaim(udid: string, wasBooted: boolean): Promise<void> {
 				entry.expiresAt = Date.now();
 			}
 		});
+		claimedHere.delete(udid);
 		throw error;
 	}
 }
@@ -256,11 +266,18 @@ async function claim(
 	wasBooted: boolean,
 ): Promise<DeviceLease> {
 	const now = Date.now();
-	return await withLedger((state) => {
+	// A lease this process already holds is not free just because we are the
+	// holder: another open session is using that device.
+	if (claimedHere.has(device.udid)) {
+		throw new Error(`simulator ${device.udid} is already leased by an open session in this process`);
+	}
+	const lease = await withLedger((state) => {
 		const existing = state.devices[device.udid];
-		if (existing && existing.holderPid !== process.pid && isAlive(existing.holderPid) && existing.expiresAt > now) {
+		// Expiry is not release. A live holder keeps the device however long
+		// its run has taken.
+		if (existing && existing.holderPid !== process.pid && !unheld(existing)) {
 			throw new Error(
-				`simulator ${device.udid} is leased by pid ${existing.holderPid} until ${new Date(existing.expiresAt).toISOString()}`,
+				`simulator ${device.udid} is leased by live pid ${existing.holderPid} (lease until ${new Date(existing.expiresAt).toISOString()})`,
 			);
 		}
 		const lease: DeviceLease = {
@@ -278,33 +295,53 @@ async function claim(
 		state.devices[device.udid] = lease;
 		return lease;
 	});
+	claimedHere.add(device.udid);
+	return lease;
 }
 
-/** A scratch device we created, currently held by nobody, matching the spec. */
+/**
+ * UDIDs leased by *this* process right now.
+ *
+ * The ledger cannot express this: it records one holder pid, so two sessions
+ * in the same MCP instance look identical to it. Without this set, opening two
+ * simulator sessions could hand out the same device and closing one would
+ * shut the other's target down.
+ */
+const claimedHere = new Set<string>();
+
+/**
+ * A scratch device we created that nothing is currently holding.
+ *
+ * "Nothing" includes this process: two `ios_session open` calls in one MCP
+ * instance must not be handed the same device, or closing the first would shut
+ * the second's target down underneath it.
+ */
 async function findIdleScratch(runtimeId: string, deviceTypeId: string): Promise<SimDevice | null> {
 	const state = await withLedger((current) => current);
 	const devices = await listSimulators();
-	const now = Date.now();
 	for (const device of devices) {
 		const lease = state.devices[device.udid];
 		if (!lease || lease.provenance !== "created") continue;
 		if (device.runtimeId !== runtimeId) continue;
 		if (deviceTypeId && device.deviceTypeId && device.deviceTypeId !== deviceTypeId) continue;
-		const held = lease.holderPid !== 0 && isAlive(lease.holderPid) && lease.expiresAt > now;
-		if (held && lease.holderPid !== process.pid) continue;
+		if (!unheld(lease)) continue;
 		return device;
 	}
 	return null;
 }
 
-/** Delete the oldest unheld scratch devices until we are back under the ceiling. */
+/**
+ * Delete the oldest *unheld* scratch devices until we are back under the
+ * ceiling. A device someone is still using is never a candidate, however old
+ * its lease looks — the ceiling exists to stop accumulation, not to preempt
+ * running work.
+ */
 async function enforceScratchCeiling(): Promise<void> {
 	const state = await withLedger((current) => current);
 	const mine = Object.values(state.devices)
 		.filter((lease) => lease.provenance === "created")
 		.sort((a, b) => a.acquiredAt - b.acquiredAt);
-	const now = Date.now();
-	const free = mine.filter((lease) => lease.holderPid === 0 || !isAlive(lease.holderPid) || lease.expiresAt <= now);
+	const free = mine.filter(unheld);
 	let over = mine.length - (MAX_SCRATCH_DEVICES - 1);
 	for (const lease of free) {
 		if (over <= 0) break;
@@ -332,32 +369,23 @@ export interface ReleaseOutcome {
 export async function releaseSimulator(udid: string, options: ReleaseOptions = {}): Promise<ReleaseOutcome> {
 	// Take the lease over atomically before touching the device: another
 	// lazy-ios instance may be mid-run against it, and `destroy` is instant.
-	const lease = await withLedger((state) => {
-		const entry = state.devices[udid];
-		if (!entry) return null;
-		const foreign = entry.holderPid !== 0 && entry.holderPid !== process.pid && isAlive(entry.holderPid);
-		if (foreign && entry.expiresAt > Date.now()) {
-			throw new Error(
-				`refusing to release ${udid}: leased by pid ${entry.holderPid} until ${new Date(entry.expiresAt).toISOString()}`,
-			);
-		}
-		entry.holderPid = process.pid;
-		return { ...entry };
-	});
-	if (!lease) return { udid, action: "not-leased", reason: "no lease recorded — left untouched" };
+	const lease = await seizeLease(udid);
+	if (!lease) {
+		claimedHere.delete(udid);
+		return { udid, action: "not-leased", reason: "no lease recorded — left untouched" };
+	}
 
 	if (lease.provenance === "adopted") {
-		if (lease.wasBooted) {
-			await withLedger((state) => {
-				delete state.devices[udid];
-			});
-			return { udid, action: "left-running", reason: "adopted device was already booted before lazy-ios touched it" };
-		}
-		await shutdown(udid);
+		// Only shut down what we booted; an adopted device that was already
+		// running is left exactly as we found it.
+		if (!lease.wasBooted) await shutdown(udid);
 		await withLedger((state) => {
 			delete state.devices[udid];
 		});
-		return { udid, action: "shutdown", reason: "adopted device booted by lazy-ios, restored to shutdown" };
+		claimedHere.delete(udid);
+		return lease.wasBooted
+			? { udid, action: "left-running", reason: "adopted device was already booted before lazy-ios touched it" }
+			: { udid, action: "shutdown", reason: "adopted device booted by lazy-ios, restored to shutdown" };
 	}
 
 	if (options.destroy) {
@@ -372,18 +400,65 @@ export async function releaseSimulator(udid: string, options: ReleaseOptions = {
 			entry.expiresAt = Date.now();
 		}
 	});
+	claimedHere.delete(udid);
 	return { udid, action: "shutdown", reason: "scratch device kept shut down for reuse" };
 }
 
+/**
+ * Atomically become the holder of a lease, or refuse.
+ *
+ * This is the compare-and-swap that every destructive path must go through.
+ * Reading the ledger, deciding, and then deleting is not enough: between the
+ * snapshot and the `simctl delete`, another lazy-ios instance can claim the
+ * device and start a run on it. Taking the lease inside the lock means a
+ * concurrent `claim` sees us as the live holder and backs off.
+ *
+ * Returns null when there is no lease at all. Throws when a *live* process
+ * other than us holds it — regardless of the deadline, because expiry is not
+ * evidence that a run has finished.
+ */
+async function seizeLease(udid: string): Promise<DeviceLease | null> {
+	return await withLedger((state) => {
+		const entry = state.devices[udid];
+		if (!entry) return null;
+		if (entry.holderPid !== process.pid && !unheld(entry)) {
+			throw new Error(
+				`refusing to touch ${udid}: held by live pid ${entry.holderPid} (lease until ${new Date(entry.expiresAt).toISOString()})`,
+			);
+		}
+		entry.holderPid = process.pid;
+		return { ...entry };
+	});
+}
+
+/**
+ * Delete a scratch device. Two gates: provenance must be "created", and the
+ * lease must be seizable — we never delete a device a live process holds.
+ */
 async function destroyOwned(lease: DeviceLease): Promise<void> {
 	if (lease.provenance !== "created") {
 		throw new Error(`refusing to delete ${lease.udid}: provenance is "${lease.provenance}", not "created"`);
 	}
+	const seized = await seizeLease(lease.udid);
+	if (!seized) return;
+	if (seized.provenance !== "created") {
+		throw new Error(`refusing to delete ${lease.udid}: provenance changed to "${seized.provenance}"`);
+	}
 	await shutdown(lease.udid).catch(() => undefined);
-	await run(["xcrun", "simctl", "delete", lease.udid], { timeout: 120_000 });
+	const deleted = await run(["xcrun", "simctl", "delete", lease.udid], { timeout: 120_000 });
+	// Dropping the record after a failed delete would orphan the device: it
+	// would still exist, and nothing would remember that we may reclaim it.
+	if (deleted.code !== 0 && !/Invalid device|Unable to find/i.test(`${deleted.stderr}${deleted.stdout}`)) {
+		await withLedger((state) => {
+			const entry = state.devices[lease.udid];
+			if (entry) entry.holderPid = 0;
+		});
+		throw new Error(`simctl delete ${lease.udid} failed: ${(deleted.stderr || deleted.stdout).trim().slice(0, 300)}`);
+	}
 	await withLedger((state) => {
 		delete state.devices[lease.udid];
 	});
+	claimedHere.delete(lease.udid);
 }
 
 export interface ReapReport {
@@ -391,11 +466,19 @@ export interface ReapReport {
 	released: ReleaseOutcome[];
 	/** Ledger entries whose device no longer exists; the entry is dropped. */
 	pruned: string[];
+	/** Live holders past their deadline. Reported only — never reclaimed. */
+	overdue: Array<{ udid: string; holderPid: number; overdueMs: number; purpose: string }>;
+	/** Leases that could not be reclaimed, with the reason. */
+	skipped: Array<{ udid: string; reason: string }>;
 }
 
 /**
- * Reclaim every lease no live process holds. Scratch devices are deleted,
- * adopted devices are only unlatched.
+ * Reclaim every lease whose holder is gone.
+ *
+ * "Gone" means the pid is dead or the lease was explicitly released — never
+ * merely that a deadline passed, because a long `keepOpen` session or a slow
+ * test suite is still using its device. Overdue live leases are reported so a
+ * human can look, and left alone.
  */
 export async function reapSimulators(options: { destroyScratch?: boolean } = {}): Promise<ReapReport> {
 	const state = await withLedger((current) => current);
@@ -403,36 +486,43 @@ export async function reapSimulators(options: { destroyScratch?: boolean } = {})
 	const live = new Set((await listSimulators()).map((device) => device.udid));
 	const released: ReleaseOutcome[] = [];
 	const pruned: string[] = [];
+	const skipped: ReapReport["skipped"] = [];
+	const now = Date.now();
 
 	for (const lease of candidates) {
 		if (!live.has(lease.udid)) {
 			await withLedger((current) => {
 				delete current.devices[lease.udid];
 			});
+			claimedHere.delete(lease.udid);
 			pruned.push(lease.udid);
 			continue;
 		}
-		if (lease.provenance === "created") {
-			if (options.destroyScratch) {
-				await destroyOwned(lease);
-				released.push({ udid: lease.udid, action: "deleted", reason: "expired scratch lease" });
-			} else {
-				await shutdown(lease.udid).catch(() => undefined);
-				await withLedger((current) => {
-					const entry = current.devices[lease.udid];
-					if (entry) {
-						entry.holderPid = 0;
-						entry.expiresAt = Date.now();
-					}
-				});
-				released.push({ udid: lease.udid, action: "shutdown", reason: "expired scratch lease, kept for reuse" });
-			}
-			continue;
+		try {
+			// Always go through releaseSimulator: it re-seizes the lease inside
+			// the ledger lock. `candidates` is a snapshot, and between taking it
+			// and acting another process can legitimately claim the device —
+			// shutting it down from here would kill a live run.
+			released.push(await releaseSimulator(lease.udid, { destroy: options.destroyScratch }));
+		} catch (error) {
+			// A device that resists teardown keeps its ledger entry so the next
+			// reap tries again; silently dropping it would orphan it.
+			skipped.push({ udid: lease.udid, reason: (error as Error).message });
 		}
-		released.push(await releaseSimulator(lease.udid));
 	}
 
-	return { inspected: candidates.length, released, pruned };
+	return {
+		inspected: candidates.length,
+		released,
+		pruned,
+		overdue: overdue(state, now).map((lease) => ({
+			udid: lease.udid,
+			holderPid: lease.holderPid,
+			overdueMs: now - lease.expiresAt,
+			purpose: lease.purpose,
+		})),
+		skipped,
+	};
 }
 
 export async function installApp(udid: string, appPath: string): Promise<void> {

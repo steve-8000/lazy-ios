@@ -15,7 +15,7 @@
  */
 
 import { run, waitFor } from "../core/exec.ts";
-import { isAlive, withLedger } from "../core/ledger.ts";
+import { type ProcessRecord, isAlive, withLedger } from "../core/ledger.ts";
 import { APPIUM_HOME } from "./device.ts";
 
 const LEDGER_KEY = "appium";
@@ -90,6 +90,14 @@ export async function ensureAppium(options: { port?: number; restart?: boolean }
 	});
 	child.unref();
 
+	// Fingerprint the process now, not after the readiness wait: `ps` reports
+	// the real start time, and a first-run Appium can take 30 s to answer
+	// /status. Recording the post-readiness clock would make every later
+	// identity check fail, and a failing check means we never stop our own
+	// server — the exact leak this file exists to prevent.
+	const startedAt = Date.now();
+	const lstart = await processStartLine(child.pid);
+
 	const up = await waitFor(() => statusOk(port), { timeout: START_TIMEOUT_MS, interval: 400 });
 	if (!up) {
 		child.kill("SIGKILL");
@@ -97,54 +105,87 @@ export async function ensureAppium(options: { port?: number; restart?: boolean }
 	}
 
 	await withLedger((state) => {
-		state.processes[LEDGER_KEY] = {
-			key: LEDGER_KEY,
-			pid: child.pid,
-			port,
-			startedAt: Date.now(),
-			argv,
-		};
+		state.processes[LEDGER_KEY] = { key: LEDGER_KEY, pid: child.pid, port, startedAt, lstart, argv };
 	});
 	return { pid: child.pid, port, baseUrl: `http://127.0.0.1:${port}`, started: true };
 }
 
 /**
+ * `ps -o lstart=` for a pid, or "" when it is gone.
+ *
+ * `LC_ALL=C` because the field is `strftime("%c")`: under a Korean locale it
+ * comes back as "2026년 9월 8일 ..." and any parse of it fails, which would
+ * silently turn the identity check below into "never matches".
+ */
+async function processStartLine(pid: number): Promise<string> {
+	const probe = await run(["/bin/ps", "-o", "lstart=", "-p", String(pid)], {
+		timeout: 10_000,
+		env: { LC_ALL: "C" },
+	});
+	return probe.code === 0 ? probe.stdout.trim() : "";
+}
+
+/**
  * Confirm the pid still *is* the process we recorded.
  *
- * A pid is reused freely on macOS, so "the ledger says 12345 and 12345 is
- * alive" is not evidence: after a reboot or a busy day that pid may belong to
- * something else entirely. Compare the recorded start time and command line
- * before sending any signal.
+ * macOS reuses pids freely, so "the ledger says 12345 and 12345 is alive" is
+ * not evidence. Compare the start line captured at spawn — an exact string
+ * match, no clock arithmetic, so a slow startup cannot make this drift.
+ *
+ * The failure direction matters: refusing to signal our own server is worse
+ * than the pid-reuse case it guards against, because it recreates the helper
+ * leak. Hence the command-line fallback when no start line was captured.
  */
-async function identityMatches(record: { pid: number; startedAt: number; argv: readonly string[] }): Promise<boolean> {
-	const probe = await run(["/bin/ps", "-o", "lstart=,command=", "-p", String(record.pid)], { timeout: 10_000 });
+async function identityMatches(record: ProcessRecord): Promise<boolean> {
+	if (record.lstart) {
+		const current = await processStartLine(record.pid);
+		return current !== "" && current === record.lstart;
+	}
+	const probe = await run(["/bin/ps", "-o", "command=", "-p", String(record.pid)], {
+		timeout: 10_000,
+		env: { LC_ALL: "C" },
+	});
 	if (probe.code !== 0) return false;
-	const line = probe.stdout.trim();
-	if (!line) return false;
-	const split = /^(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/.exec(line);
-	if (!split) return false;
-	const [, startText, command] = split;
-	const started = Date.parse(startText!);
-	// `ps` reports whole seconds; our timestamp is taken just after spawn.
-	if (!Number.isFinite(started) || Math.abs(started - record.startedAt) > 10_000) return false;
+	const command = probe.stdout.trim();
 	const port = record.argv[record.argv.indexOf("--port") + 1];
-	return /\bappium\b/.test(command ?? "") && (!port || (command ?? "").includes(port));
+	return /\bappium\b/.test(command) && (!port || command.includes(port));
 }
 
 export async function stopAppium(): Promise<{ stopped: boolean; pid: number; reason: string }> {
-	const record = await withLedger((state) => {
-		const entry = state.processes[LEDGER_KEY];
-		delete state.processes[LEDGER_KEY];
-		return entry;
-	});
+	const record = await withLedger((state) => state.processes[LEDGER_KEY]);
 	if (!record) return { stopped: false, pid: 0, reason: "no supervised Appium recorded" };
-	if (!isAlive(record.pid)) return { stopped: false, pid: record.pid, reason: "recorded pid already gone; ledger cleared" };
+
+	// The record is only dropped once we know the process is gone. Clearing it
+	// first and then failing the identity check would leave a live server that
+	// nothing remembers how to stop.
+	const forget = async (): Promise<void> => {
+		await withLedger((state) => {
+			if (state.processes[LEDGER_KEY]?.pid === record.pid) delete state.processes[LEDGER_KEY];
+		});
+	};
+
+	if (!isAlive(record.pid)) {
+		await forget();
+		return { stopped: false, pid: record.pid, reason: "recorded pid already gone; ledger cleared" };
+	}
 	if (!(await identityMatches(record))) {
-		return { stopped: false, pid: record.pid, reason: `pid ${record.pid} is a different process now; ledger cleared without signalling` };
+		await forget();
+		return {
+			stopped: false,
+			pid: record.pid,
+			reason: `pid ${record.pid} belongs to a different process now; ledger cleared without signalling`,
+		};
 	}
 	await run(["/bin/kill", "-TERM", String(record.pid)], { timeout: 10_000 });
 	const gone = await waitFor(async () => (isAlive(record.pid) ? null : true), { timeout: 8_000, interval: 200 });
-	if (!gone) await run(["/bin/kill", "-KILL", String(record.pid)], { timeout: 10_000 });
+	if (!gone) {
+		await run(["/bin/kill", "-KILL", String(record.pid)], { timeout: 10_000 });
+		await waitFor(async () => (isAlive(record.pid) ? null : true), { timeout: 5_000, interval: 200 });
+	}
+	if (isAlive(record.pid)) {
+		return { stopped: false, pid: record.pid, reason: "still alive after SIGKILL; ledger record kept for retry" };
+	}
+	await forget();
 	return { stopped: true, pid: record.pid, reason: gone ? "terminated" : "killed after SIGTERM timeout" };
 }
 

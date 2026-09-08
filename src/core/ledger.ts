@@ -21,7 +21,7 @@
  */
 
 import { mkdirSync } from "node:fs";
-import { open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -64,6 +64,11 @@ export interface ProcessRecord {
 	pid: number;
 	port?: number;
 	startedAt: number;
+	/**
+	 * `ps -o lstart=` for this pid, captured at spawn. macOS reuses pids, so
+	 * this string is the identity check performed before any signal is sent.
+	 */
+	lstart?: string;
 	argv: readonly string[];
 }
 
@@ -73,47 +78,86 @@ export interface LedgerState {
 	processes: Record<string, ProcessRecord>;
 }
 
-const EMPTY: LedgerState = { version: LEDGER_VERSION, devices: {}, processes: {} };
+/**
+ * A fresh empty state.
+ *
+ * Must be a factory, not a shared constant: callers mutate what `readLedger`
+ * returns, and a shallow spread of a constant would share its `devices` and
+ * `processes` objects across every reader.
+ */
+function emptyState(): LedgerState {
+	return { version: LEDGER_VERSION, devices: {}, processes: {} };
+}
 
 function ensureHome(): void {
 	mkdirSync(LAZY_HOME, { recursive: true });
 }
 
+/**
+ * Cross-process advisory lock.
+ *
+ * Uses `link()` rather than `open(…, "wx")`: with `wx` the file exists for a
+ * moment before its pid is written, and a waiter that reads it in that window
+ * sees empty content. Treating empty as "corrupt, therefore stale" made two
+ * processes hold the lock at once — measured, not theoretical. `link` publishes
+ * a file that already has its contents.
+ */
 async function acquireLock(): Promise<() => Promise<void>> {
 	ensureHome();
 	const deadline = Date.now() + LOCK_WAIT_MS;
-	for (;;) {
-		try {
-			const handle = await open(LOCK_PATH, "wx");
-			await handle.writeFile(String(process.pid));
-			await handle.close();
-			return async () => {
-				await rm(LOCK_PATH, { force: true });
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			// Break a lock whose holder is gone, or one that is simply too old.
-			let stale = false;
+	const staging = `${LOCK_PATH}.${process.pid}.${Bun.randomUUIDv7().slice(0, 8)}`;
+	await writeFile(staging, `${process.pid}\n`, "utf8");
+	try {
+		for (;;) {
 			try {
-				const raw = await readFile(LOCK_PATH, "utf8");
-				const holder = Number.parseInt(raw.trim(), 10);
-				stale = !Number.isFinite(holder) || !isAlive(holder);
-				if (!stale) {
-					const info = await Bun.file(LOCK_PATH).stat();
-					stale = Date.now() - info.mtimeMs > LOCK_STALE_MS;
+				await link(staging, LOCK_PATH);
+				return async () => {
+					await rm(LOCK_PATH, { force: true });
+				};
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				if (await lockIsStale()) {
+					await rm(LOCK_PATH, { force: true });
+					continue;
 				}
-			} catch {
-				stale = true;
+				if (Date.now() >= deadline) throw new Error(`ledger lock held for >${LOCK_WAIT_MS}ms at ${LOCK_PATH}`);
+				await Bun.sleep(25);
 			}
-			if (stale) {
-				await rm(LOCK_PATH, { force: true });
-				continue;
-			}
-			if (Date.now() >= deadline) throw new Error(`ledger lock held for >${LOCK_WAIT_MS}ms at ${LOCK_PATH}`);
-			await Bun.sleep(50);
 		}
+	} finally {
+		await rm(staging, { force: true });
 	}
 }
+
+/** A lock whose holder died, or that is old enough to be abandoned. */
+async function lockIsStale(): Promise<boolean> {
+	try {
+		const raw = await readFile(LOCK_PATH, "utf8");
+		const holder = Number.parseInt(raw.trim(), 10);
+		// A live holder keeps the lock however long its mutation takes. Breaking
+		// on age alone would let a slow writer be overtaken and lose its update,
+		// which is the failure the lock exists to prevent.
+		if (Number.isFinite(holder)) return !isAlive(holder);
+		// Only an empty or unparseable lock falls back to age — that shape can
+		// only come from a process that died mid-write.
+		const info = await Bun.file(LOCK_PATH).stat();
+		return Date.now() - info.mtimeMs > LOCK_STALE_MS;
+	} catch (error) {
+		// Vanished between the failed link and this read: not stale, just gone.
+		// Retrying the link is correct and cheap.
+		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+	}
+}
+
+/**
+ * Serialises `withLedger` inside this process.
+ *
+ * The file lock alone is not enough: two concurrent calls in one process share
+ * a pid, so each would consider the other's lock its own to break, and both
+ * would write the same temp file. A promise chain makes in-process contention
+ * ordered and free.
+ */
+let ledgerQueue: Promise<unknown> = Promise.resolve();
 
 /** Signal-0 liveness probe. Returns false for pids we cannot see at all. */
 export function isAlive(pid: number): boolean {
@@ -131,14 +175,14 @@ export async function readLedger(): Promise<LedgerState> {
 	try {
 		const raw = await readFile(LEDGER_PATH, "utf8");
 		const parsed = JSON.parse(raw) as Partial<LedgerState>;
-		if (parsed.version !== LEDGER_VERSION) return { ...EMPTY };
+		if (parsed.version !== LEDGER_VERSION) return emptyState();
 		return {
 			version: LEDGER_VERSION,
 			devices: parsed.devices ?? {},
 			processes: parsed.processes ?? {},
 		};
 	} catch {
-		return { ...EMPTY };
+		return emptyState();
 	}
 }
 
@@ -149,27 +193,57 @@ export async function readLedger(): Promise<LedgerState> {
  * so it must not await long operations.
  */
 export async function withLedger<T>(mutate: (state: LedgerState) => T | Promise<T>): Promise<T> {
-	const release = await acquireLock();
-	try {
-		const state = await readLedger();
-		const value = await mutate(state);
-		const tmp = `${LEDGER_PATH}.${process.pid}.tmp`;
-		await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-		await rename(tmp, LEDGER_PATH);
-		return value;
-	} finally {
-		await release();
-	}
+	const run = async (): Promise<T> => {
+		const release = await acquireLock();
+		try {
+			const state = await readLedger();
+			const value = await mutate(state);
+			const tmp = `${LEDGER_PATH}.${process.pid}.${Bun.randomUUIDv7().slice(0, 8)}.tmp`;
+			await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+			await rename(tmp, LEDGER_PATH);
+			return value;
+		} finally {
+			await release();
+		}
+	};
+	// Chain onto the queue whether or not the previous call succeeded.
+	const queued = ledgerQueue.then(run, run);
+	ledgerQueue = queued.catch(() => undefined);
+	return await queued;
 }
 
 export const ledgerPath = LEDGER_PATH;
 
 /**
- * Leases that no live process is holding, or whose deadline passed.
- * Only these are candidates for reclamation — never anything else.
+ * True when nothing alive is holding this lease.
+ *
+ * Deliberately ignores `expiresAt`. A deadline is a hint that a run has gone
+ * long, not evidence that it is over: reclaiming a device out from under a
+ * live holder destroys a session that is still using it — a `keepOpen`
+ * session, or a test suite past the half-hour mark. Only a dead or released
+ * holder frees a device; expiry is reported, never acted on.
  */
-export function reclaimable(state: LedgerState, now = Date.now()): DeviceLease[] {
-	return Object.values(state.devices).filter(
-		(lease) => lease.expiresAt <= now || lease.holderPid === 0 || !isAlive(lease.holderPid),
-	);
+export function unheld(lease: DeviceLease): boolean {
+	return lease.holderPid === 0 || !isAlive(lease.holderPid);
+}
+
+/**
+ * Leases no live process holds. Only these may be reclaimed — never anything
+ * else, and never a device whose provenance is not "created".
+ */
+export function reclaimable(state: LedgerState): DeviceLease[] {
+	return Object.values(state.devices).filter(unheld);
+}
+
+/** Held leases whose deadline has passed. Reported by the doctor, not reaped. */
+export function overdue(state: LedgerState, now = Date.now()): DeviceLease[] {
+	return Object.values(state.devices).filter((lease) => !unheld(lease) && lease.expiresAt <= now);
+}
+
+/** Push a live lease's deadline out. Called whenever a session is used. */
+export async function renewLease(udid: string, ttl: number): Promise<void> {
+	await withLedger((state) => {
+		const lease = state.devices[udid];
+		if (lease && lease.holderPid === process.pid) lease.expiresAt = Date.now() + ttl;
+	});
 }

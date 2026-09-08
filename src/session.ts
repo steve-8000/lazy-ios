@@ -16,7 +16,7 @@
 
 import { mkdirSync } from "node:fs";
 
-import { LAZY_HOME } from "./core/ledger.ts";
+import { LAZY_HOME, renewLease } from "./core/ledger.ts";
 import {
 	type AppiumServer,
 	type WebDriverSession,
@@ -82,7 +82,16 @@ export function getSession(id: string): Session {
 		throw new Error(`unknown session "${id}"${known.length ? ` (open: ${known.join(", ")})` : " (none open)"}`);
 	}
 	session.lastUsedAt = Date.now();
+	// Push the ledger deadline out too. The deadline is what a human reads to
+	// judge whether a run has gone wrong; without renewal, a long interactive
+	// session would show as overdue forever.
+	if (session.kind === "simulator") void renewLease(session.udid, leaseTtl(session.idleTimeoutMs));
 	return session;
+}
+
+/** Ledger lease length for a given idle budget: generous, but finite. */
+function leaseTtl(idleTimeoutMs: number): number {
+	return Math.max(idleTimeoutMs * 2, 30 * 60_000);
 }
 
 export interface OpenSimulatorRequest {
@@ -130,7 +139,7 @@ export async function openSession(request: OpenRequest): Promise<Session> {
 			deviceType: request.deviceType,
 			purpose,
 			fresh: request.fresh,
-			ttl: Math.max(idleTimeoutMs * 2, 30 * 60_000),
+			ttl: leaseTtl(idleTimeoutMs),
 		});
 		const session: Session = {
 			id,
@@ -234,6 +243,10 @@ export async function closeSession(id: string, options: { destroy?: boolean } = 
 		sessions.delete(id);
 		return { id, kind: session.kind, udid: session.udid, device, webdriver };
 	} catch (error) {
+		// Clear `closing` so the idle sweeper retries. Leaving it set would make
+		// one failed teardown permanent for the process's lifetime — the device
+		// stays booted and nothing automatic ever tries again.
+		session.closing = false;
 		session.teardownError = (error as Error).message;
 		throw error;
 	}
