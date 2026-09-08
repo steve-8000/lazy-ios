@@ -5,3 +5,6 @@ node_modules/
 # xcodegen output — regenerate with `xcodegen generate` in Fixtures/LazyProbe
 Fixtures/**/*.xcodeproj/
 Fixtures/**/*.xcworkspace/
+
+# zvec-grep daemon state
+.zvec-grep/
