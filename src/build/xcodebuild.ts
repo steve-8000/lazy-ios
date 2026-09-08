@@ -249,6 +249,12 @@ export async function build(request: BuildRequest): Promise<BuildOutcome> {
 		// certificates do not cover the scheme's bundle id.
 		argv.push("CODE_SIGNING_ALLOWED=NO", "CODE_SIGNING_REQUIRED=NO", "CODE_SIGN_IDENTITY=");
 	} else {
+		// Command-line settings outrank the project file, and they have to:
+		// a project carrying `CODE_SIGNING_ALLOWED=NO` (normal for something
+		// only ever run on a simulator) otherwise builds a valid-looking
+		// unsigned .app, and the failure surfaces much later as an opaque
+		// `ApplicationVerificationFailed` from the device at install time.
+		argv.push("CODE_SIGNING_ALLOWED=YES", "CODE_SIGNING_REQUIRED=YES", "CODE_SIGN_STYLE=Automatic");
 		if (request.developmentTeam) argv.push(`DEVELOPMENT_TEAM=${request.developmentTeam}`);
 		if (request.allowProvisioningUpdates !== false) argv.push("-allowProvisioningUpdates");
 	}

@@ -21,7 +21,7 @@ import {
 	listSchemes,
 	test as runTests,
 } from "./build/xcodebuild.ts";
-import { devicectlLaunch } from "./ios/device.ts";
+import { devicectlLaunch, resolveSigningTeam } from "./ios/device.ts";
 import { installApp, launchApp, terminateApp } from "./ios/simulator.ts";
 import { installOnDevice, activateApp } from "./ios/appium.ts";
 import { type Session, closeSession, openSession } from "./session.ts";
@@ -179,6 +179,31 @@ export async function runLazy(request: RunRequest): Promise<RunReport> {
 
 		// ── build ──
 		const destination = `id=${activeSession.udid}`;
+
+		// Resolved once, before the build/test split: both paths compile for
+		// the same device and both fail the same opaque way when unsigned. A
+		// device build that is not signed for *this* device still succeeds and
+		// dies later at install with `ApplicationVerificationFailed`, which
+		// names neither the team nor the device.
+		let developmentTeam = request.developmentTeam;
+		if (activeSession.kind === "device" && !developmentTeam) {
+			phases.push(
+				await timed("signing", async () => {
+					const signing = await resolveSigningTeam(activeSession.udid);
+					if (!signing) {
+						throw new Error(
+							`no unexpired provisioning profile on this Mac lists device ${activeSession.udid}. ` +
+								`Open Xcode > Settings > Accounts, select the team, and register the device, ` +
+								`or pass developmentTeam explicitly.`,
+						);
+					}
+					developmentTeam = signing.team;
+					return `team ${signing.team} via "${signing.profileName}"`;
+				}),
+			);
+			if (!phases.at(-1)?.ok) throw new Halt();
+		}
+
 		if (request.test) {
 			phases.push(
 				await timed("test", async () => {
@@ -188,7 +213,7 @@ export async function runLazy(request: RunRequest): Promise<RunReport> {
 						destination,
 						configuration: request.configuration,
 						forSimulator: activeSession.kind === "simulator",
-						developmentTeam: request.developmentTeam,
+						developmentTeam,
 						only: request.only,
 					});
 					if (!testSummary.ok) {
@@ -211,7 +236,7 @@ export async function runLazy(request: RunRequest): Promise<RunReport> {
 						destination,
 						configuration: request.configuration,
 						forSimulator: activeSession.kind === "simulator",
-						developmentTeam: request.developmentTeam,
+						developmentTeam,
 					});
 					if (!buildOutcome.ok) {
 						const errors = buildOutcome.issues.filter((issue) => issue.kind === "error").slice(0, 5);

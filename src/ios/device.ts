@@ -28,6 +28,93 @@ import { run, runJson } from "../core/exec.ts";
 export const DEFAULT_TUNNEL_REGISTRY_PORT = 42314;
 export const APPIUM_HOME = process.env.APPIUM_HOME ?? join(homedir(), ".appium");
 
+const PROFILE_DIR = join(homedir(), "Library/Developer/Xcode/UserData/Provisioning Profiles");
+
+/** A development profile that can sign for one specific attached device. */
+export interface SigningTeam {
+	team: string;
+	profileName: string;
+	/** `TEAM.*` for a wildcard profile, otherwise the exact app id. */
+	applicationIdentifier: string;
+	wildcard: boolean;
+	expiresAt: number;
+}
+
+/**
+ * One key out of a decoded profile.
+ *
+ * The whole plist cannot be converted to JSON: it embeds the signing
+ * certificate as `<data>`, and `plutil -convert json` rejects the file with
+ * "Invalid object in plist for JSON format". Extracting per key sidesteps the
+ * binary members entirely, and the keys we need are strings and string arrays.
+ */
+async function extractKey(plist: string, keyPath: string, format: "json" | "raw"): Promise<string | null> {
+	const out = await run(["plutil", "-extract", keyPath, format, "-o", "-", "-"], {
+		timeout: 10_000,
+		stdin: plist,
+	});
+	return out.code === 0 ? out.stdout.trim() : null;
+}
+
+function parseStringArray(raw: string | null): string[] {
+	if (!raw) return [];
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * The signing team that can install on this device, or null.
+ *
+ * A profile only signs for a physical device if it *lists* that device, so
+ * `ProvisionedDevices` is the filter — not the team, and not the app id. Store
+ * profiles carry no device list at all and are silently useless here, which is
+ * exactly the shape that produces `ApplicationVerificationFailed` at install
+ * time rather than an error at build time.
+ *
+ * Wildcards win: a `TEAM.*` profile covers a fixture bundle id nobody
+ * registered, which is the normal case for a scratch app under test.
+ */
+export async function resolveSigningTeam(udid: string): Promise<SigningTeam | null> {
+	if (!existsSync(PROFILE_DIR)) return null;
+	const glob = new Bun.Glob("*.mobileprovision");
+	const candidates: SigningTeam[] = [];
+	for await (const entry of glob.scan({ cwd: PROFILE_DIR, absolute: true })) {
+		const decoded = await run(["security", "cms", "-D", "-i", entry], { timeout: 10_000 });
+		if (decoded.code !== 0) continue;
+		const plist = decoded.stdout;
+
+		// Cheapest discriminator first: most profiles on a developer machine
+		// are store profiles with no device list at all.
+		const devices = parseStringArray(await extractKey(plist, "ProvisionedDevices", "json"));
+		if (!devices.includes(udid)) continue;
+
+		const team = parseStringArray(await extractKey(plist, "TeamIdentifier", "json"))[0];
+		if (!team) continue;
+		const applicationIdentifier = (await extractKey(plist, "Entitlements.application-identifier", "raw")) ?? "";
+		const expiry = await extractKey(plist, "ExpirationDate", "raw");
+		const expiresAt = expiry ? Date.parse(expiry) : Number.NaN;
+		// An expired profile signs a build that the device then refuses, which
+		// is the same opaque install failure this resolver exists to prevent.
+		// An unparseable date is treated as expired: we cannot show it is
+		// valid, and guessing in the permissive direction reintroduces the bug.
+		if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) continue;
+		candidates.push({
+			team,
+			profileName: (await extractKey(plist, "Name", "raw")) ?? entry,
+			applicationIdentifier,
+			wildcard: applicationIdentifier.endsWith(".*"),
+			expiresAt,
+		});
+	}
+	if (candidates.length === 0) return null;
+	candidates.sort((a, b) => (a.wildcard === b.wildcard ? b.expiresAt - a.expiresAt : a.wildcard ? -1 : 1));
+	return candidates[0] ?? null;
+}
+
 export interface RealDevice {
 	/** Hardware UDID — the only identifier Appium/WDA accept. */
 	udid: string;
