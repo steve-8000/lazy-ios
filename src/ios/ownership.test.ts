@@ -142,6 +142,44 @@ test("a corrupt ledger fails closed instead of reading as empty", async () => {
 	expect((await readLedger()).devices[udid]).toBeDefined();
 });
 
+test("separate processes writing the ledger do not lose updates", async () => {
+	// The in-process queue cannot be what makes this pass — these are real OS
+	// processes, so only the `flock` on the lock fd serialises them. Every
+	// path-based lock tried before this (`open(…,"wx")`, `link()` + stale
+	// breaking) could admit two writers when a holder died, and last-writer-
+	// wins silently dropped a claim.
+	const writer = join(home, "writer.ts");
+	await writeFile(
+		writer,
+		`const { withLedger } = await import(${JSON.stringify(join(import.meta.dir, "../core/ledger.ts"))});
+		const key = process.argv[2];
+		await withLedger((state) => {
+			// Hold the critical section open long enough that unserialised
+			// writers would certainly interleave.
+			const until = Date.now() + 40;
+			while (Date.now() < until);
+			state.processes[key] = { key, pid: 1, startedAt: Date.now(), argv: ["x"] };
+		});`,
+		"utf8",
+	);
+
+	const keys = Array.from({ length: 6 }, (_, index) => `proc-${index}`);
+	const codes = await Promise.all(
+		keys.map(async (key) => {
+			const child = Bun.spawn(["bun", writer, key], {
+				env: { ...process.env, LAZY_IOS_HOME: home },
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			return await child.exited;
+		}),
+	);
+	expect(codes).toEqual(keys.map(() => 0));
+
+	const recorded = Object.keys((await readLedger()).processes);
+	expect(keys.filter((key) => recorded.includes(key))).toEqual(keys);
+});
+
 test("concurrent ledger writers do not lose updates", async () => {
 	// A lost update here is a device that exists but is recorded nowhere —
 	// the original leak. This caught a real race: the lock file was visible

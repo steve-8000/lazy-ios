@@ -20,16 +20,15 @@
  * interleave a read-modify-write.
  */
 
-import { mkdirSync } from "node:fs";
-import { link, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { dlopen, FFIType } from "bun:ffi";
+import { closeSync, mkdirSync, openSync } from "node:fs";
+import { readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 export const LAZY_HOME = process.env.LAZY_IOS_HOME ?? join(homedir(), ".lazy-ios");
 const LEDGER_PATH = join(LAZY_HOME, "ledger.json");
 const LOCK_PATH = join(LAZY_HOME, "ledger.lock");
-/** A lock older than this belonged to a process that died holding it. */
-const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 10_000;
 
 export const LEDGER_VERSION = 2;
@@ -94,80 +93,75 @@ function ensureHome(): void {
 }
 
 /**
- * Cross-process advisory lock.
+ * Cross-process advisory lock, backed by `flock(2)`.
  *
- * Uses `link()` rather than `open(…, "wx")`: with `wx` the file exists for a
- * moment before its pid is written, and a waiter that reads it in that window
- * sees empty content. Treating empty as "corrupt, therefore stale" made two
- * processes hold the lock at once — measured, not theoretical. `link` publishes
- * a file that already has its contents.
+ * Every path-based scheme tried before this one — `open(…,"wx")`, then
+ * `link()` with inode-checked release — has the same irreducible flaw: the
+ * lock is a *name*, so breaking an abandoned one is a separate, racy
+ * operation, and two waiters can both remove it and both proceed. Each fix
+ * only relocated the race (a breaker file needs its own breaker).
+ *
+ * `flock` has no such problem. The lock lives on the open file description,
+ * not the path: the kernel releases it when the fd closes or the process dies,
+ * so there is nothing to detect as stale and the file is never unlinked. The
+ * measured semantics on this machine (darwin, APFS) are that a second `flock`
+ * with LOCK_NB fails even from the same process on a different fd.
  */
-async function acquireLock(): Promise<() => Promise<void>> {
-	ensureHome();
-	const deadline = Date.now() + LOCK_WAIT_MS;
-	const staging = `${LOCK_PATH}.${process.pid}.${crypto.randomUUID().slice(0, 8)}`;
-	await writeFile(staging, `${process.pid}\n`, "utf8");
-	try {
-		for (;;) {
-			try {
-				await link(staging, LOCK_PATH);
-				const token = await Bun.file(LOCK_PATH).stat();
-				return async () => {
-					// Only unlink a lock that is still the one we created. If a
-					// waiter judged ours stale and took over, deleting blindly
-					// would drop *their* lock and admit a third writer.
-					try {
-						const current = await Bun.file(LOCK_PATH).stat();
-						if (current.ino !== token.ino) return;
-					} catch {
-						return; // already gone
-					}
-					await rm(LOCK_PATH, { force: true });
-				};
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-				if (await lockIsStale()) {
-					await rm(LOCK_PATH, { force: true });
-					continue;
-				}
-				if (Date.now() >= deadline) throw new Error(`ledger lock held for >${LOCK_WAIT_MS}ms at ${LOCK_PATH}`);
-				await Bun.sleep(25);
-			}
-		}
-	} finally {
-		await rm(staging, { force: true });
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const LOCK_UN = 8;
+
+const libc = dlopen("libSystem.B.dylib", {
+	flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+});
+
+let lockFd: number | null = null;
+
+function lockDescriptor(): number {
+	if (lockFd === null) {
+		ensureHome();
+		// "a+" creates on demand and never truncates: the file's contents are
+		// irrelevant, only its identity as a lock target.
+		lockFd = openSync(LOCK_PATH, "a+");
 	}
+	return lockFd;
 }
 
-/** A lock whose holder died, or that is old enough to be abandoned. */
-async function lockIsStale(): Promise<boolean> {
-	try {
-		const raw = await readFile(LOCK_PATH, "utf8");
-		const holder = Number.parseInt(raw.trim(), 10);
-		// A live holder keeps the lock however long its mutation takes. Breaking
-		// on age alone would let a slow writer be overtaken and lose its update,
-		// which is the failure the lock exists to prevent.
-		if (Number.isFinite(holder)) return !isAlive(holder);
-		// Only an empty or unparseable lock falls back to age — that shape can
-		// only come from a process that died mid-write.
-		const info = await Bun.file(LOCK_PATH).stat();
-		return Date.now() - info.mtimeMs > LOCK_STALE_MS;
-	} catch (error) {
-		// Vanished between the failed link and this read: not stale, just gone.
-		// Retrying the link is correct and cheap.
-		return (error as NodeJS.ErrnoException).code !== "ENOENT";
+async function acquireLock(): Promise<() => Promise<void>> {
+	const fd = lockDescriptor();
+	const deadline = Date.now() + LOCK_WAIT_MS;
+	for (;;) {
+		if (libc.symbols.flock(fd, LOCK_EX | LOCK_NB) === 0) {
+			return async () => {
+				libc.symbols.flock(fd, LOCK_UN);
+			};
+		}
+		if (Date.now() >= deadline) {
+			throw new Error(`ledger lock held for >${LOCK_WAIT_MS}ms at ${LOCK_PATH}`);
+		}
+		await Bun.sleep(25);
 	}
 }
 
 /**
  * Serialises `withLedger` inside this process.
  *
- * The file lock alone is not enough: two concurrent calls in one process share
- * a pid, so each would consider the other's lock its own to break, and both
- * would write the same temp file. A promise chain makes in-process contention
- * ordered and free.
+ * Load-bearing, not an optimisation: `flock` is held per open file
+ * description, and this process keeps exactly one. A second concurrent
+ * `withLedger` on the same fd would have its `flock` succeed immediately —
+ * re-locking an fd you already own is a no-op upgrade — and two mutations
+ * would interleave. The queue is what makes in-process access exclusive;
+ * `flock` handles the cross-process half.
  */
 let ledgerQueue: Promise<unknown> = Promise.resolve();
+
+/** Release the lock fd. Used by tests; the kernel does this on exit anyway. */
+export function closeLedgerLock(): void {
+	if (lockFd !== null) {
+		closeSync(lockFd);
+		lockFd = null;
+	}
+}
 
 /** Signal-0 liveness probe. Returns false for pids we cannot see at all. */
 export function isAlive(pid: number): boolean {

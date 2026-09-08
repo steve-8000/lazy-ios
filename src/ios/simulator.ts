@@ -191,10 +191,18 @@ export async function acquireSimulator(options: AcquireOptions): Promise<Acquire
 	const deviceType = await resolveDeviceType(options.deviceType);
 
 	if (!options.fresh) {
-		const reusable = await findIdleScratch(runtime.identifier, deviceType.identifier);
-		if (reusable) {
+		// Every idle candidate, not just the first: two concurrent opens read
+		// the same snapshot, so the one that loses the claim must try the next
+		// device rather than fail. Falling through to `create` is the last
+		// resort, which is why this loop swallows only claim contention.
+		for (const reusable of await findIdleScratch(runtime.identifier, deviceType.identifier)) {
 			const wasBooted = reusable.state === "Booted";
-			const lease = await claim(reusable, "created", options.purpose, ttl, wasBooted);
+			let lease: DeviceLease;
+			try {
+				lease = await claim(reusable, "created", options.purpose, ttl, wasBooted);
+			} catch {
+				continue;
+			}
 			await bootOrUnclaim(reusable.udid, wasBooted);
 			return { lease, device: (await findSimulator(reusable.udid)) ?? reusable, disposition: "reused" };
 		}
@@ -319,24 +327,27 @@ async function claim(
 const claimedHere = new Set<string>();
 
 /**
- * A scratch device we created that nothing is currently holding.
+ * Scratch devices we created that nothing is currently holding.
  *
- * "Nothing" includes this process: two `ios_session open` calls in one MCP
- * instance must not be handed the same device, or closing the first would shut
- * the second's target down underneath it.
+ * "Nothing" includes this process. The ledger's `holderPid` cannot distinguish
+ * "released by us earlier" from "in use by another session of ours right now",
+ * so `claimedHere` is consulted too — otherwise two `ios_session open` calls
+ * would be offered the same device and the loser would have to fall back to
+ * creating one for no reason.
  */
-async function findIdleScratch(runtimeId: string, deviceTypeId: string): Promise<SimDevice | null> {
+async function findIdleScratch(runtimeId: string, deviceTypeId: string): Promise<SimDevice[]> {
 	const state = await withLedger((current) => current);
 	const devices = await listSimulators();
+	const candidates: SimDevice[] = [];
 	for (const device of devices) {
 		const lease = state.devices[device.udid];
 		if (!lease || lease.provenance !== "created") continue;
 		if (device.runtimeId !== runtimeId) continue;
 		if (deviceTypeId && device.deviceTypeId && device.deviceTypeId !== deviceTypeId) continue;
-		if (!unheld(lease)) continue;
-		return device;
+		if (!unheld(lease) || claimedHere.has(device.udid)) continue;
+		candidates.push(device);
 	}
-	return null;
+	return candidates;
 }
 
 /**
@@ -354,8 +365,14 @@ async function enforceScratchCeiling(): Promise<void> {
 	let over = mine.length - (MAX_SCRATCH_DEVICES - 1);
 	for (const lease of free) {
 		if (over <= 0) break;
-		await destroyOwned(lease);
-		over -= 1;
+		try {
+			await destroyOwned(lease);
+			over -= 1;
+		} catch {
+			// Refused because a session claimed it between the snapshot and now,
+			// or the delete failed. Being one device over the ceiling is a cost;
+			// deleting a device someone is using is a defect.
+		}
 	}
 }
 
@@ -378,9 +395,12 @@ export interface ReleaseOutcome {
 export async function releaseSimulator(udid: string, options: ReleaseOptions = {}): Promise<ReleaseOutcome> {
 	// Take the lease over atomically before touching the device: another
 	// lazy-ios instance may be mid-run against it, and `destroy` is instant.
-	const lease = await seizeLease(udid);
+	const lease = await seizeLease(udid, "release");
 	if (!lease) {
-		claimedHere.delete(udid);
+		// Deliberately does NOT clear `claimedHere`: with no ledger entry the
+		// only way this udid is in that set is a concurrent `openSession` that
+		// has reserved it but not yet written its lease. Clearing it here would
+		// hand the same device to a second session.
 		return { udid, action: "not-leased", reason: "no lease recorded — left untouched" };
 	}
 
@@ -398,7 +418,7 @@ export async function releaseSimulator(udid: string, options: ReleaseOptions = {
 	}
 
 	if (options.destroy) {
-		await destroyOwned(lease);
+		await destroyOwned(lease, { alreadySeized: true });
 		return { udid, action: "deleted", reason: "scratch device destroyed on request" };
 	}
 	await shutdown(udid);
@@ -426,8 +446,19 @@ export async function releaseSimulator(udid: string, options: ReleaseOptions = {
  * other than us holds it — regardless of the deadline, because expiry is not
  * evidence that a run has finished.
  */
-async function seizeLease(udid: string): Promise<DeviceLease | null> {
+async function seizeLease(udid: string, intent: SeizeIntent): Promise<DeviceLease | null> {
+	// The ledger records one holder pid, so it cannot distinguish "this process
+	// released it" from "another session in this process is using it right
+	// now". `claimedHere` is the only thing that can, which makes it authority
+	// for reclamation, not a hint: without this check a scratch-ceiling sweep
+	// could delete a device a concurrent `openSession` had just claimed.
 	return await withLedger((state) => {
+		// Checked inside the lock, immediately before the holder is rewritten.
+		// A check before the first await would be a TOCTOU: a concurrent
+		// `openSession` can add to `claimedHere` while we wait on the lock.
+		if (intent === "reclaim" && claimedHere.has(udid)) {
+			throw new Error(`refusing to reclaim ${udid}: an open session in this process is using it`);
+		}
 		const entry = state.devices[udid];
 		if (!entry) return null;
 		if (entry.holderPid !== process.pid && !unheld(entry)) {
@@ -441,14 +472,27 @@ async function seizeLease(udid: string): Promise<DeviceLease | null> {
 }
 
 /**
+ * Why a lease is being taken over.
+ *
+ * `release` is the holder handing its own device back — it may take a lease
+ * that `claimedHere` still lists, because that entry *is* its claim.
+ * `reclaim` is a third party (ceiling sweep, reaper) and must never touch a
+ * device an open session holds.
+ */
+type SeizeIntent = "release" | "reclaim";
+
+/**
  * Delete a scratch device. Two gates: provenance must be "created", and the
  * lease must be seizable — we never delete a device a live process holds.
  */
-async function destroyOwned(lease: DeviceLease): Promise<void> {
+async function destroyOwned(lease: DeviceLease, options: { alreadySeized?: boolean } = {}): Promise<void> {
 	if (lease.provenance !== "created") {
 		throw new Error(`refusing to delete ${lease.udid}: provenance is "${lease.provenance}", not "created"`);
 	}
-	const seized = await seizeLease(lease.udid);
+	// `alreadySeized` means the caller is the holder releasing its own device;
+	// re-seizing with "reclaim" intent would refuse on its own `claimedHere`
+	// entry. Everyone else must pass the reclaim gate.
+	const seized = options.alreadySeized ? lease : await seizeLease(lease.udid, "reclaim");
 	if (!seized) return;
 	if (seized.provenance !== "created") {
 		throw new Error(`refusing to delete ${lease.udid}: provenance changed to "${seized.provenance}"`);

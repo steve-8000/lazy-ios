@@ -33,6 +33,40 @@ export interface RunOptions {
 const DEFAULT_TIMEOUT = 60_000;
 const DEFAULT_MAX_OUTPUT = 4 * 1024 * 1024;
 
+/**
+ * Process-group leaders spawned by `run` that have not exited.
+ *
+ * `detached: true` buys a reliable timeout kill, but it also means these
+ * children no longer die with the parent's process group. Tracking them lets
+ * `killChildren` finish the job on an orderly shutdown.
+ */
+const liveGroups = new Set<number>();
+
+/** SIGKILL a child's whole process group, falling back to the child alone. */
+function killGroup(pid: number): void {
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {
+			// Already reaped.
+		}
+	}
+}
+
+/**
+ * Kill every still-running child group. Called from the shutdown path so an
+ * interrupted build does not leave `xcodebuild` and its compiler processes
+ * behind — the leak this project exists to remove.
+ */
+export function killChildren(): number {
+	const count = liveGroups.size;
+	for (const pid of liveGroups) killGroup(pid);
+	liveGroups.clear();
+	return count;
+}
+
 export class CommandError extends Error {
 	constructor(
 		message: string,
@@ -69,16 +103,11 @@ export async function run(argv: readonly string[], options: RunOptions = {}): Pr
 		detached: true,
 	});
 
+	liveGroups.add(proc.pid);
 	let timedOut = false;
 	const timer = setTimeout(() => {
 		timedOut = true;
-		// Negative pid targets the whole group. Falls back to the lone child if
-		// the group is already gone (ESRCH) or was never created.
-		try {
-			process.kill(-proc.pid, "SIGKILL");
-		} catch {
-			proc.kill("SIGKILL");
-		}
+		killGroup(proc.pid);
 	}, timeout);
 
 	try {
@@ -97,6 +126,9 @@ export async function run(argv: readonly string[], options: RunOptions = {}): Pr
 		};
 	} finally {
 		clearTimeout(timer);
+		// Untrack before the pid can be recycled. A stale entry would make
+		// `killChildren` signal whatever process later inherits this pid.
+		liveGroups.delete(proc.pid);
 	}
 }
 

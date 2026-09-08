@@ -16,6 +16,7 @@
 
 import { mkdirSync } from "node:fs";
 
+import { killChildren } from "./core/exec.ts";
 import { LAZY_HOME, renewLease } from "./core/ledger.ts";
 import {
 	type AppiumServer,
@@ -58,6 +59,8 @@ export interface Session {
 	bundleId?: string;
 	/** Set while teardown is in flight; blocks the idle sweeper from racing it. */
 	closing?: boolean;
+	/** The single in-flight teardown. Concurrent closers await this one. */
+	teardown?: Promise<CloseOutcome>;
 	/** Last teardown failure. Non-empty means the device is still held. */
 	teardownError?: string;
 }
@@ -268,6 +271,22 @@ export interface CloseOutcome {
 export async function closeSession(id: string, options: { destroy?: boolean } = {}): Promise<CloseOutcome> {
 	const session = sessions.get(id);
 	if (!session) throw new Error(`unknown session "${id}"`);
+	// An explicit close racing the idle sweeper, or `closeAll` racing a manual
+	// close, must not both tear the same device down: the second `seizeLease`
+	// would succeed (same pid) and shut down or delete a device the first call
+	// has already released. Join the teardown already in flight instead.
+	if (session.teardown) return await session.teardown;
+
+	const teardown = performTeardown(id, session, options);
+	session.teardown = teardown;
+	return await teardown;
+}
+
+async function performTeardown(
+	id: string,
+	session: Session,
+	options: { destroy?: boolean },
+): Promise<CloseOutcome> {
 	session.closing = true;
 
 	try {
@@ -288,6 +307,9 @@ export async function closeSession(id: string, options: { destroy?: boolean } = 
 		// one failed teardown permanent for the process's lifetime — the device
 		// stays booted and nothing automatic ever tries again.
 		session.closing = false;
+		// Drop the shared handle too, or every later retry would re-await this
+		// same rejected promise and never actually try again.
+		session.teardown = undefined;
 		session.teardownError = (error as Error).message;
 		throw error;
 	}
@@ -344,6 +366,12 @@ function wireShutdown(): void {
 	// Synchronous-enough teardown: simctl shutdown is fast, and leaving a
 	// booted scratch device behind is precisely the bug this project fixes.
 	const bail = (signal: NodeJS.Signals): void => {
+		// `run` spawns children into their own process group so a timeout can
+		// reach descendants; the cost is that they no longer die with our group.
+		// An interrupted build would otherwise leave xcodebuild and its
+		// compilers running, and they would still be writing into a DerivedData
+		// tree whose simulator we are about to release.
+		killChildren();
 		void closeAll().finally(() => {
 			process.exit(signal === "SIGINT" ? 130 : 143);
 		});
@@ -351,6 +379,7 @@ function wireShutdown(): void {
 	process.once("SIGINT", bail);
 	process.once("SIGTERM", bail);
 	process.once("beforeExit", () => {
+		killChildren();
 		void closeAll();
 	});
 }
