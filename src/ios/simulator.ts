@@ -12,6 +12,21 @@
 import { run, runJson, runOk, waitFor } from "../core/exec.ts";
 import { type DeviceLease, overdue, reclaimable, unheld, withLedger } from "../core/ledger.ts";
 
+/**
+ * Another holder already has this device.
+ *
+ * Distinct from every other failure on purpose: contention means "try a
+ * different device", while a corrupt ledger or a lock timeout means "stop".
+ * Without a type to test, the reuse loop would swallow a `LedgerCorrupt` and
+ * quietly create a simulator while ownership was unknown.
+ */
+export class LeaseContended extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "LeaseContended";
+	}
+}
+
 /** Devices we create are named with this prefix. It is a hint, never authority. */
 export const SCRATCH_PREFIX = "lazy-ios";
 /** Ceiling on simultaneously-leased scratch devices; older ones get reaped first. */
@@ -193,15 +208,19 @@ export async function acquireSimulator(options: AcquireOptions): Promise<Acquire
 	if (!options.fresh) {
 		// Every idle candidate, not just the first: two concurrent opens read
 		// the same snapshot, so the one that loses the claim must try the next
-		// device rather than fail. Falling through to `create` is the last
-		// resort, which is why this loop swallows only claim contention.
+		// device rather than fail.
 		for (const reusable of await findIdleScratch(runtime.identifier, deviceType.identifier)) {
 			const wasBooted = reusable.state === "Booted";
 			let lease: DeviceLease;
 			try {
 				lease = await claim(reusable, "created", options.purpose, ttl, wasBooted);
-			} catch {
-				continue;
+			} catch (error) {
+				// Only contention means "try the next device". A corrupt ledger
+				// or a lock timeout must stop the whole acquire — creating a
+				// simulator while ownership is unknown is how devices become
+				// orphans.
+				if (error instanceof LeaseContended) continue;
+				throw error;
 			}
 			await bootOrUnclaim(reusable.udid, wasBooted);
 			return { lease, device: (await findSimulator(reusable.udid)) ?? reusable, disposition: "reused" };
@@ -281,7 +300,7 @@ async function claim(
 	// set makes `has`-then-`add` the only option, so the check must happen
 	// with no suspension point between it and the insert.
 	if (claimedHere.has(device.udid)) {
-		throw new Error(`simulator ${device.udid} is already leased by an open session in this process`);
+		throw new LeaseContended(`simulator ${device.udid} is already leased by an open session in this process`);
 	}
 	claimedHere.add(device.udid);
 	try {
@@ -290,7 +309,7 @@ async function claim(
 			// Expiry is not release. A live holder keeps the device however long
 			// its run has taken.
 			if (existing && existing.holderPid !== process.pid && !unheld(existing)) {
-				throw new Error(
+				throw new LeaseContended(
 					`simulator ${device.udid} is leased by live pid ${existing.holderPid} (lease until ${new Date(existing.expiresAt).toISOString()})`,
 				);
 			}
@@ -368,10 +387,12 @@ async function enforceScratchCeiling(): Promise<void> {
 		try {
 			await destroyOwned(lease);
 			over -= 1;
-		} catch {
-			// Refused because a session claimed it between the snapshot and now,
-			// or the delete failed. Being one device over the ceiling is a cost;
-			// deleting a device someone is using is a defect.
+		} catch (error) {
+			// A session claimed it between the snapshot and now. Being one
+			// device over the ceiling is a cost; deleting a device someone is
+			// using is a defect. Anything that is not contention — a corrupt
+			// ledger, a failed delete — belongs to the caller.
+			if (!(error instanceof LeaseContended)) throw error;
 		}
 	}
 }
@@ -457,12 +478,12 @@ async function seizeLease(udid: string, intent: SeizeIntent): Promise<DeviceLeas
 		// A check before the first await would be a TOCTOU: a concurrent
 		// `openSession` can add to `claimedHere` while we wait on the lock.
 		if (intent === "reclaim" && claimedHere.has(udid)) {
-			throw new Error(`refusing to reclaim ${udid}: an open session in this process is using it`);
+			throw new LeaseContended(`refusing to reclaim ${udid}: an open session in this process is using it`);
 		}
 		const entry = state.devices[udid];
 		if (!entry) return null;
 		if (entry.holderPid !== process.pid && !unheld(entry)) {
-			throw new Error(
+			throw new LeaseContended(
 				`refusing to touch ${udid}: held by live pid ${entry.holderPid} (lease until ${new Date(entry.expiresAt).toISOString()})`,
 			);
 		}

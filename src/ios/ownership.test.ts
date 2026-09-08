@@ -180,6 +180,45 @@ test("separate processes writing the ledger do not lose updates", async () => {
 	expect(keys.filter((key) => recorded.includes(key))).toEqual(keys);
 });
 
+test("a killed lock holder does not block the next writer", async () => {
+	// The reason the lock is flock(2) and not a lock file. Every path-based
+	// scheme needed a stale-detection heuristic to recover from this, and each
+	// heuristic had a race that let two writers in. Here the kernel releases
+	// the lock when the holder dies, so the next writer just proceeds.
+	const holder = join(home, "holder.ts");
+	await writeFile(
+		holder,
+		`const { withLedger } = await import(${JSON.stringify(join(import.meta.dir, "../core/ledger.ts"))});
+		await withLedger(() => {
+			console.log("locked");
+			// Never returns; the parent SIGKILLs this process while it holds
+			// the lock, simulating a crash mid-mutation.
+			Bun.sleepSync(60_000);
+		});`,
+		"utf8",
+	);
+
+	const child = Bun.spawn(["bun", holder], {
+		env: { ...process.env, LAZY_IOS_HOME: home },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	// Wait for it to actually hold the lock before killing it.
+	const reader = child.stdout.getReader();
+	const first = await reader.read();
+	expect(new TextDecoder().decode(first.value)).toContain("locked");
+	child.kill("SIGKILL");
+	await child.exited;
+
+	const started = Date.now();
+	await withLedger((state) => {
+		state.processes["after-crash"] = { key: "after-crash", pid: DEAD_PID, startedAt: Date.now(), argv: ["x"] };
+	});
+	// No stale timeout to wait out: the kernel already released it.
+	expect(Date.now() - started).toBeLessThan(2_000);
+	expect((await readLedger()).processes["after-crash"]).toBeDefined();
+});
+
 test("concurrent ledger writers do not lose updates", async () => {
 	// A lost update here is a device that exists but is recorded nowhere —
 	// the original leak. This caught a real race: the lock file was visible
