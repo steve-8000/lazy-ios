@@ -1,0 +1,22 @@
+{
+  "name": "lazy-ios",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "One MCP that owns iOS build/test automation end to end: simulators, real devices, and UI evidence.",
+  "bin": {
+    "lazy-ios": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+
+# xcodegen output — regenerate with `xcodegen generate` in Fixtures/LazyProbe
+Fixtures/**/*.xcodeproj/
+Fixtures/**/*.xcworkspace/
